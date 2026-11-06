@@ -7,6 +7,18 @@ public struct Storage: Sendable {
     /// The internal storage area.
     var storage: [ObjectIdentifier: AnyStorageValue]
 
+    /// What this copy has written since ``Application`` began recording, so that only those writes are applied
+    /// to the application's storage. `nil` when not recording, as for the storage of a request or a response.
+    var writes: Writes?
+
+    /// The writes made to a copy of the application's storage.
+    struct Writes: Sendable {
+        /// Whether the copy was cleared: every key the copy did not write since is removed.
+        var cleared = false
+        /// The keys written since: each takes the copy's value, or is removed when the copy has none.
+        var keys: Set<ObjectIdentifier> = []
+    }
+
     /// A container for a stored value and an associated optional `deinit`-like closure.
     struct Value<T: Sendable>: AnyStorageValue {
         var value: T
@@ -38,12 +50,15 @@ public struct Storage: Sendable {
     /// Create a new ``Storage`` container using the given logger.
     public init(logger: Logger = .init(label: "codes.vapor.storage")) {
         self.storage = [:]
+        self.writes = nil
         self.logger = logger
     }
 
     /// Delete all values from the container. Does _not_ invoke shutdown closures.
     public mutating func clear() {
         self.storage = [:]
+        self.writes?.cleared = true
+        self.writes?.keys = []
     }
 
     /// Read/write access to values via keyed subscript.
@@ -102,8 +117,10 @@ public struct Storage: Sendable {
         let key = ObjectIdentifier(Key.self)
         if let value = value {
             self.storage[key] = Value(value: value, onShutdown: onShutdown)
+            self.writes?.keys.insert(key)
         } else if let existing = self.storage[key] {
             self.storage[key] = nil
+            self.writes?.keys.insert(key)
             existing.shutdown(logger: self.logger)
         }
     }
@@ -121,8 +138,10 @@ public struct Storage: Sendable {
         let key = ObjectIdentifier(Key.self)
         if let value = value {
             self.storage[key] = Value(value: value, onShutdown: nil, onAsyncShutdown: onShutdown)
+            self.writes?.keys.insert(key)
         } else if let existing = self.storage[key] {
             self.storage[key] = nil
+            self.writes?.keys.insert(key)
             await existing.asyncShutdown(logger: self.logger)
         }
     }
@@ -141,6 +160,21 @@ public struct Storage: Sendable {
         precondition(self.storage[key] == nil, "You must not call this when a value already exists in storage")
         if let value {
             self.storage[key] = Value(value: value, onShutdown: onShutdown, onAsyncShutdown: onAsyncShutdown)
+            self.writes?.keys.insert(key)
+        }
+    }
+
+    /// Applies what `copy` wrote while it recorded its writes: a key it wrote takes its value, or is removed when it
+    /// has none, and every other key keeps the value this storage holds.
+    mutating func apply(writesOf copy: Storage) {
+        guard let writes = copy.writes else {
+            return
+        }
+        if writes.cleared {
+            self.storage = [:]
+        }
+        for key in writes.keys {
+            self.storage[key] = copy.storage[key]
         }
     }
 
