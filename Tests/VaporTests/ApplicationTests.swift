@@ -371,4 +371,61 @@ final class ApplicationTests: XCTestCase {
         XCTAssertEqual(returnedConfig.hostname, "0.0.0.0")
         XCTAssertEqual(returnedConfig.port, 3000)
     }
+
+    func testStorageKeepsEveryWriteWhenTwoKeysAreWrittenAtTheSameTime() {
+        struct First: StorageKey { typealias Value = Int }
+        struct Second: StorageKey { typealias Value = Int }
+        let app: Application = self.app
+        let dropped = NIOLockedValueBox<[Int]>([0, 0])
+
+        // Each worker writes a key of its own and reads it back. Nothing else writes that key, so a value
+        // that isn't there was dropped by the other worker's write.
+        DispatchQueue.concurrentPerform(iterations: 2) { worker in
+            var lost = 0
+            for value in 0..<10_000 {
+                if worker == 0 {
+                    app.storage[First.self] = value
+                    if app.storage[First.self] != value { lost += 1 }
+                } else {
+                    app.storage[Second.self] = value
+                    if app.storage[Second.self] != value { lost += 1 }
+                }
+            }
+            dropped.withLockedValue { $0[worker] = lost }
+        }
+
+        XCTAssertEqual(dropped.withLockedValue { $0 }, [0, 0], "writes dropped out of 10,000, per key")
+    }
+
+    func testStorageKeepsAWriteMadeWhileAnotherWriteIsUnderway() {
+        struct Outer: StorageKey { typealias Value = Int }
+        struct Inner: StorageKey { typealias Value = Int }
+        let app: Application = self.app
+
+        // The default value is computed in the middle of the write of `Outer`, and writes `Inner` itself.
+        let outer = app.storage[Outer.self, default: {
+            app.storage[Inner.self] = 2
+            return 1
+        }()]
+
+        XCTAssertEqual(outer, 1)
+        XCTAssertEqual(app.storage[Outer.self], 1)
+        XCTAssertEqual(app.storage[Inner.self], 2)
+    }
+
+    func testStorageKeepsAWriteMadeWhileAnAsyncWriteIsSuspended() async {
+        struct Removed: StorageKey { typealias Value = Int }
+        struct Written: StorageKey { typealias Value = Int }
+        let app: Application = self.app
+        await app.storage.setWithAsyncShutdown(Removed.self, to: 1) { _ in
+            await Task.yield()
+            app.storage[Written.self] = 2
+        }
+
+        // Removing the value runs its shutdown in the middle of the removal, and the shutdown writes `Written`.
+        await app.storage.setWithAsyncShutdown(Removed.self, to: nil)
+
+        XCTAssertNil(app.storage[Removed.self])
+        XCTAssertEqual(app.storage[Written.self], 2)
+    }
 }

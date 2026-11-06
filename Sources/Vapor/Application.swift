@@ -15,12 +15,27 @@ public final class Application: Sendable {
         }
     }
     
+    /// Arbitrary values kept for the lifetime of the application, keyed by ``StorageKey``.
+    ///
+    /// Writes made at the same time from different threads are all kept, whatever their keys.
     public var storage: Storage {
         get {
             self._storage.withLockedValue { $0 }
         }
         set {
             self._storage.withLockedValue { $0 = newValue }
+        }
+        _modify {
+            // A write in place (`storage[Key.self] = value`, or a mutating method) changes a copy, outside the lock:
+            // the change may call back into this storage (a default value, a shutdown closure) or suspend
+            // (`setWithAsyncShutdown`). Only what the copy wrote is then applied to the stored value, under the lock,
+            // so a write another thread made to another key meanwhile is kept.
+            var copy = self._storage.withLockedValue { $0 }
+            copy.writes = .init()
+            defer {
+                self._storage.withLockedValue { $0.apply(writesOf: copy) }
+            }
+            yield &copy
         }
     }
     
